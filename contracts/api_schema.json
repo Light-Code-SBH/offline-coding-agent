@@ -1,0 +1,56 @@
+{
+    "analysis_request": {
+        "description": "Request sent from Frontend → Backend to analyze code",
+        "schema": {
+            "code": "string — the source code to analyze",
+            "language": "string — one of: python, java, c, javascript",
+            "action": "string — one of: debug, explain, fix, analyze_all",
+            "options": {
+                "include_explanation": "boolean — include line-by-line explanation",
+                "include_fixes": "boolean — include fix suggestions",
+                "max_suggestions": "integer — max number of fix suggestions (default: 3)"
+            }
+        },
+        "example": {
+            "code": "def add(a, b):\n    return a + b\nresult = add(1, '2')\nprint(result)",
+            "language": "python",
+            "action": "debug",
+            "options": {
+                "include_explanation": true,
+                "include_fixes": true,
+                "max_suggestions": 3
+            }
+        }
+    },
+    "analysis_response": {
+        "description": "Response sent from Backend → Frontend with analysis results",
+        "schema": {
+            "status": "string — one of: success, error",
+            "language": "string — detected/confirmed language",
+            "errors": [
+                {
+                    "line": "integer — line number",
+                    "column": "integer — column number",
+                    "type": "string — one of: syntax, runtime, logic, style",
+                    "severity": "string — one of: error, warning, info",
+                    "message": "string — human-readable error description",
+                    "suggestion": "string — suggested fix (if available)",
+                    "fixed_code": "string — corrected code snippet (if available)"
+                }
+            ],
+            "explanations": [
+                {
+                    "line_start": "integer — start line of explained block",
+                    "line_end": "integer — end line of explained block",
+                    "code": "string — the code being explained",
+                    "explanation": "string — plain English explanation"
+                }
+            ],
+            "summary": {
+                "total_errors": "integer",
+                "total_warnings": "integer",
+                "overall_assessment": "string — brief summary of code quality"
+            }
+        }
+    }
+}
