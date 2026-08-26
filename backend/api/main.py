@@ -6,23 +6,42 @@ FastAPI application that serves as the bridge between Frontend and Backend modul
 Owner: Member 4 (Backend Lead)
 """
 
+import sys
+import os
+import logging
+
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from typing import Optional, List
-import logging
 
-# Initialize FastAPI app
+# Make project root importable so ai_engine / code_analysis packages resolve
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..")))
+
+from ai_engine.model_manager import ModelManager
+from ai_engine.inference.pipeline import InferencePipeline
+from code_analysis.error_detector import ErrorDetector
+
 app = FastAPI(
     title="AI Offline Coding Assistant API",
     description="Backend API for offline code analysis, debugging, and explanation",
     version="0.1.0"
 )
 
+from fastapi.middleware.cors import CORSMiddleware
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:5173"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 logger = logging.getLogger(__name__)
 
 
 # ============================================================
-# Request/Response Models (based on contracts/api_schema.json)
+# Request/Response Models
 # ============================================================
 
 class AnalysisOptions(BaseModel):
@@ -33,16 +52,16 @@ class AnalysisOptions(BaseModel):
 
 class AnalysisRequest(BaseModel):
     code: str
-    language: str  # python, java, c, javascript
-    action: str    # debug, explain, fix, analyze_all
+    language: str
+    action: str
     options: Optional[AnalysisOptions] = AnalysisOptions()
 
 
 class ErrorDetail(BaseModel):
     line: int
     column: int = 0
-    type: str       # syntax, runtime, logic, style
-    severity: str   # error, warning, info
+    type: str
+    severity: str
     message: str
     suggestion: Optional[str] = None
     fixed_code: Optional[str] = None
@@ -51,7 +70,7 @@ class ErrorDetail(BaseModel):
 class ExplanationDetail(BaseModel):
     line_start: int
     line_end: int
-    code: str
+    code: str = ""
     explanation: str
 
 
@@ -62,11 +81,32 @@ class AnalysisSummary(BaseModel):
 
 
 class AnalysisResponse(BaseModel):
-    status: str  # success, error
+    status: str
     language: str
     errors: List[ErrorDetail] = []
     explanations: List[ExplanationDetail] = []
     summary: Optional[AnalysisSummary] = None
+
+
+# ============================================================
+# Global instances (loaded on startup)
+# ============================================================
+
+model_manager = ModelManager()
+inference = InferencePipeline(model_manager)
+detector = ErrorDetector()
+
+DEFAULT_MODEL = "deepseek-coder-6.7b"
+
+
+@app.on_event("startup")
+def startup_event():
+    logger.info("Loading default model on startup...")
+    success = model_manager.load_model(DEFAULT_MODEL)
+    if success:
+        logger.info(f"Model '{DEFAULT_MODEL}' loaded successfully.")
+    else:
+        logger.warning(f"Failed to load model '{DEFAULT_MODEL}'. /analyze will fail until a model is loaded.")
 
 
 # ============================================================
@@ -75,70 +115,194 @@ class AnalysisResponse(BaseModel):
 
 @app.get("/")
 def root():
-    """Health check endpoint."""
     return {"status": "running", "service": "AI Offline Coding Assistant"}
 
 
 @app.get("/health")
 def health_check():
-    """Detailed health check."""
-    # TODO: Check if model is loaded, parsers are ready, etc.
     return {
         "status": "healthy",
-        "model_loaded": False,  # TODO: Check actual model status
-        "supported_languages": ["python", "java", "c", "javascript"]
+        "model_loaded": model_manager.loaded_model is not None,
+        "current_model": model_manager.model_name,
+        "supported_languages": list(detector.parsers.keys()),
     }
 
 
 @app.post("/analyze", response_model=AnalysisResponse)
 def analyze_code(request: AnalysisRequest):
+    if request.language not in detector.parsers:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unsupported language: {request.language}. Supported: {list(detector.parsers.keys())}"
+        )
+
+    # Step 1: Static analysis (tree-sitter / ast based)
+    static_errors = detector.detect(request.code, request.language)
+
+    error_details = [
+        ErrorDetail(
+            line=e.line,
+            column=getattr(e, "column", 0),
+            type=e.error_type,
+            severity=getattr(e, "severity", "error"),
+            message=e.message,
+            suggestion=getattr(e, "suggestion", None),
+            fixed_code=getattr(e, "fixed_code", None),
+        )
+        for e in static_errors
+    ]
+
+    # Step 2: AI-enhanced analysis
+    ai_result = {}
+    if model_manager.loaded_model is not None:
+        try:
+            ai_result = inference.debug_code(request.code, request.language)
+            for ai_err in ai_result.get("errors", []):
+                error_details.append(ErrorDetail(
+                    line=ai_err.get("line", 0),
+                    type=ai_err.get("type", "logic"),
+                    severity="warning",
+                    message=ai_err.get("message", ""),
+                    suggestion=ai_err.get("suggestion"),
+                ))
+        except Exception as e:
+            logger.error(f"AI debug_code failed: {e}")
+
+    # Step 3: Explanations (optional)
+    explanation_details = []
+    if request.options.include_explanation and model_manager.loaded_model is not None:
+        try:
+            exp_result = inference.explain_code(request.code, request.language)
+            for exp in exp_result.get("explanations", []):
+                explanation_details.append(ExplanationDetail(
+                    line_start=exp.get("line_start", 0),
+                    line_end=exp.get("line_end", 0),
+                    explanation=exp.get("explanation", ""),
+                ))
+        except Exception as e:
+            logger.error(f"AI explain_code failed: {e}")
+
+    return AnalysisResponse(
+        status="success",
+        language=request.language,
+        errors=error_details,
+        explanations=explanation_details,
+        summary=AnalysisSummary(
+            total_errors=len([e for e in error_details if e.severity == "error"]),
+            total_warnings=len([e for e in error_details if e.severity == "warning"]),
+            overall_assessment="Analysis complete"
+        )
+    )
+
+
+@app.post("/analyze/static", response_model=AnalysisResponse)
+def analyze_static_code(request: AnalysisRequest):
+    """Return fast, deterministic diagnostics without waking the local LLM.
+
+    The editor calls this endpoint while the user is typing.  Keeping it
+    separate from ``/analyze`` means syntax feedback is available even when a
+    model is still loading or a longer AI analysis is in progress.
     """
-    Main endpoint — analyze code for errors, fixes, and explanations.
-    
-    This endpoint:
-    1. Routes to the appropriate language parser (Member 2's code)
-    2. Sends to AI engine for enhanced analysis (Member 1's code)
-    3. Returns structured results to frontend (Member 3's code)
-    """
-    # TODO (Member 4): Implement the analysis pipeline
-    # 1. Validate language is supported
-    # 2. Call ErrorDetector.detect() for static analysis
-    # 3. Call InferencePipeline for AI-enhanced analysis
-    # 4. Combine results and return
-    raise HTTPException(status_code=501, detail="Member 4: Implement analysis endpoint")
+    if request.language not in detector.parsers:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unsupported language: {request.language}. Supported: {list(detector.parsers.keys())}"
+        )
+
+    static_errors = detector.detect(request.code, request.language)
+    error_details = [
+        ErrorDetail(
+            line=e.line,
+            column=getattr(e, "column", 0),
+            type=e.error_type,
+            severity=getattr(e, "severity", "error"),
+            message=e.message,
+            suggestion=getattr(e, "suggestion", None),
+            fixed_code=getattr(e, "fixed_code", None),
+        )
+        for e in static_errors
+    ]
+
+    return AnalysisResponse(
+        status="success",
+        language=request.language,
+        errors=error_details,
+        summary=AnalysisSummary(
+            total_errors=len([e for e in error_details if e.severity == "error"]),
+            total_warnings=len([e for e in error_details if e.severity == "warning"]),
+            overall_assessment="Live static analysis complete",
+        ),
+    )
 
 
 @app.post("/explain", response_model=AnalysisResponse)
 def explain_code(request: AnalysisRequest):
-    """Generate line-by-line explanation of code."""
-    # TODO (Member 4): Route to explanation pipeline
-    raise HTTPException(status_code=501, detail="Member 4: Implement explain endpoint")
+    if model_manager.loaded_model is None:
+        raise HTTPException(status_code=503, detail="No model loaded")
+
+    result = inference.explain_code(request.code, request.language)
+    explanation_details = [
+        ExplanationDetail(
+            line_start=exp.get("line_start", 0),
+            line_end=exp.get("line_end", 0),
+            explanation=exp.get("explanation", ""),
+        )
+        for exp in result.get("explanations", [])
+    ]
+
+    return AnalysisResponse(
+        status="success",
+        language=request.language,
+        explanations=explanation_details,
+    )
 
 
 @app.post("/fix", response_model=AnalysisResponse)
 def suggest_fix(request: AnalysisRequest):
-    """Suggest fixes for detected errors."""
-    # TODO (Member 4): Route to fix suggestion pipeline
-    raise HTTPException(status_code=501, detail="Member 4: Implement fix endpoint")
+    if model_manager.loaded_model is None:
+        raise HTTPException(status_code=503, detail="No model loaded")
+
+    static_errors = detector.detect(request.code, request.language)
+    if not static_errors:
+        return AnalysisResponse(status="success", language=request.language, errors=[])
+
+    first_error = static_errors[0]
+    result = inference.suggest_fix(
+        request.code,
+        {"message": first_error.message, "line": first_error.line},
+        request.language
+    )
+
+    return AnalysisResponse(
+        status="success",
+        language=request.language,
+        errors=[ErrorDetail(
+            line=first_error.line,
+            type=first_error.error_type,
+            severity="error",
+            message=first_error.message,
+            fixed_code=result.get("fixed_code"),
+            suggestion=result.get("explanation"),
+        )],
+    )
 
 
 @app.get("/models")
 def list_models():
-    """List available AI models."""
-    # TODO (Member 4): Call ModelManager.list_available_models()
-    raise HTTPException(status_code=501, detail="Member 4: Implement model listing")
+    return {
+        "available": model_manager.list_available_models(),
+        "current": model_manager.model_name,
+    }
 
 
 @app.post("/models/{model_name}/load")
 def load_model(model_name: str):
-    """Load a specific AI model."""
-    # TODO (Member 4): Call ModelManager.load_model()
-    raise HTTPException(status_code=501, detail="Member 4: Implement model loading")
+    success = model_manager.load_model(model_name)
+    if not success:
+        raise HTTPException(status_code=500, detail=f"Failed to load model: {model_name}")
+    return {"status": "loaded", "model": model_name}
 
 
-# ============================================================
-# Run server (for development)
-# ============================================================
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="127.0.0.1", port=8000)
